@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
-
 import numpy as np
 import pandas as pd
 
@@ -94,13 +92,19 @@ def asymmetric_metrics(actual: pd.Series, forecast: pd.Series, peak_quantile: fl
 
 
 def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFrame:
-    """Evaluate one-step and 4-hour-ahead forecasts on the final time block."""
+    """Evaluate target times reached from origins in the final time block.
+
+    The seasonal lag is known at each forecast origin. For horizon ``h``, the
+    first scored target is ``holdout_start + h``; this prevents the horizon
+    labels from scoring exactly the same target set.
+    """
     cutoff = frame.index.max() - pd.Timedelta(days=holdout_days) + pd.Timedelta(minutes=15)
     rows: list[dict[str, float | str]] = []
     for horizon in (1, 4, 16):
         for quantile, label in ((0.0, "weekly_seasonal_naive"), (0.8, "conservative_q80")):
             forecast = seasonal_forecast(frame, horizon, quantile, cutoff)
-            mask = (frame.index >= cutoff) & frame["is_scoring_eligible"]
+            target_start = cutoff + pd.Timedelta(minutes=15 * horizon)
+            mask = (frame.index >= target_start) & frame["is_scoring_eligible"]
             metrics = asymmetric_metrics(frame.loc[mask, "load_kw"], forecast.loc[mask])
             rows.append({"horizon_15min": horizon, "model": label, **metrics})
     return pd.DataFrame(rows)
@@ -202,15 +206,19 @@ def plot_eda(frame: pd.DataFrame, output_dir: str | Path) -> tuple[Path, Path]:
 
 
 def plot_forecast_comparison(frame: pd.DataFrame, metrics: pd.DataFrame, output_dir: str | Path) -> tuple[Path, Path]:
-    """Save horizon error and a representative holdout-week comparison."""
+    """Save horizon error and a predeclared holdout-week comparison."""
     import matplotlib.pyplot as plt
 
     cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
     first_monday = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
-    typical_start, typical_end, _ = select_representative_week(
-        frame, first_start=first_monday.strftime("%Y-%m-%d"), last_start="2025-12-15"
-    )
-    actual = frame.loc[typical_start:typical_end, "load_kw"]
+    comparison_start = first_monday
+    while comparison_start <= pd.Timestamp("2025-12-15"):
+        candidate_index = pd.date_range(comparison_start, periods=SLOTS_PER_WEEK, freq="15min")
+        if frame["load_kw"].reindex(candidate_index).notna().all():
+            break
+        comparison_start += pd.Timedelta(days=7)
+    comparison_end = comparison_start + pd.Timedelta(days=6, hours=23, minutes=45)
+    actual = frame.loc[comparison_start:comparison_end, "load_kw"]
     naive = seasonal_forecast(frame, 1, 0.0, cutoff).loc[actual.index]
     conservative = seasonal_forecast(frame, 1, .8, cutoff).loc[actual.index]
     horizon = metrics.groupby(["horizon_15min", "model"], as_index=False).weighted_absolute_error_kw.first()
@@ -228,10 +236,83 @@ def plot_forecast_comparison(frame: pd.DataFrame, metrics: pd.DataFrame, output_
     naive.plot(ax=axis, color="#377eb8", alpha=.8, label="weekly naive")
     conservative.plot(ax=axis, color="#e41a1c", alpha=.8, label="conservative q80")
     axis.set_ylabel("kW")
-    axis.set_title(f"Typical week comparison: {typical_start:%d %b} to {typical_end:%d %b %Y}")
+    axis.set_title(f"Predeclared holdout week: {comparison_start:%d %b} to {comparison_end:%d %b %Y}")
     axis.legend()
     second = save_plot(fig, output_dir, "04_typical_week_forecast_comparison.png")
     return first, second
+
+
+def add_german_holiday_flag(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add German public-holiday flags when the optional dependency is installed."""
+    result = frame.copy()
+    try:
+        import holidays
+
+        calendar = holidays.country_holidays("DE", years=sorted(set(result.index.year)))
+        result["is_public_holiday"] = pd.Index(result.index.date).isin(calendar)
+    except ImportError:
+        result["is_public_holiday"] = False
+    return result
+
+
+def run_regression_baseline(frame: pd.DataFrame) -> tuple[dict[str, float], pd.Series]:
+    """Fit the small calendar/lag regression on pre-holdout data only."""
+    features = frame[["load_kw", "lag_day_kw", "lag_week_kw"]].copy()
+    features["hour_sin"] = np.sin(2 * np.pi * frame.index.hour / 24)
+    features["hour_cos"] = np.cos(2 * np.pi * frame.index.hour / 24)
+    features["weekday"] = (frame.index.dayofweek < 5).astype(int)
+    model_data = features.dropna()
+    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
+    train = model_data.index < cutoff
+    columns = ["lag_day_kw", "lag_week_kw", "hour_sin", "hour_cos", "weekday"]
+    design_train = np.c_[np.ones(train.sum()), model_data.loc[train, columns]]
+    coefficients = np.linalg.lstsq(design_train, model_data.loc[train, "load_kw"], rcond=None)[0]
+    prediction = pd.Series(np.c_[np.ones(len(model_data)), model_data[columns]] @ coefficients, index=model_data.index)
+    score = asymmetric_metrics(model_data.loc[model_data.index >= cutoff, "load_kw"], prediction.loc[prediction.index >= cutoff])
+    return score, pd.Series(coefficients, index=["intercept"] + columns).sort_values(key=abs, ascending=False)
+
+
+def dispatch(load_kw: pd.Series, forecast_kw: pd.Series, threshold_kw: float = 80.0, battery_kwh: float = 100.0, power_kw: float = 50.0, efficiency: float = .92) -> pd.DataFrame:
+    """Clip forecasted load above a threshold subject to simple battery limits."""
+    load_kw = pd.Series(load_kw).astype(float)
+    forecast_kw = pd.Series(forecast_kw, index=load_kw.index).astype(float)
+    dispatch_kw = np.minimum(np.maximum(forecast_kw - threshold_kw, 0), power_kw)
+    dispatch_kw = np.minimum(dispatch_kw, load_kw.clip(lower=0))
+    energy_used = dispatch_kw * .25 / efficiency
+    dispatch_kw = dispatch_kw.where(energy_used.cumsum() <= battery_kwh, 0.0)
+    return pd.DataFrame({"load_kw": load_kw, "forecast_kw": forecast_kw, "discharge_kw": dispatch_kw, "net_load_kw": load_kw - dispatch_kw})
+
+
+def run_dispatch_demo(frame: pd.DataFrame, forecast: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the illustrative dispatch demo on the first complete holdout week."""
+    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
+    start = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
+    end = start + pd.Timedelta(days=6, hours=23, minutes=45)
+    actual = frame.loc[start:end, "load_kw"]
+    simulation = dispatch(actual, forecast.loc[actual.index])
+    thresholds = pd.DataFrame({"threshold_kw": [70, 80, 90], "risk_posture": ["aggressive protection", "balanced", "arbitrage preserving"]})
+    thresholds["rule"] = thresholds.apply(lambda row: f"Weekdays 08:00-18:00: clip forecast above {row.threshold_kw} kW ({row.risk_posture})", axis=1)
+    return simulation, thresholds
+
+
+def run_forecast_analysis(frame: pd.DataFrame, output_dir: str | Path) -> dict[str, object]:
+    """Run holdout scoring, regression comparison, and saved forecast plots."""
+    metrics = evaluate_holdout(frame)
+    regression_metrics, coefficients = run_regression_baseline(frame)
+    paths = plot_forecast_comparison(frame, metrics, output_dir)
+    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
+    start = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
+    end = start + pd.Timedelta(days=6, hours=23, minutes=45)
+    actual = frame.loc[start:end, "load_kw"]
+    forecast = seasonal_forecast(frame, 1, .8, cutoff).loc[actual.index]
+    return {
+        "metrics": metrics,
+        "regression_metrics": regression_metrics,
+        "coefficients": coefficients,
+        "plot_paths": paths,
+        "actual": actual,
+        "forecast": forecast,
+    }
 
 
 def run_pipeline(input_path: str | Path, output_dir: str | Path = "outputs") -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | str]]:

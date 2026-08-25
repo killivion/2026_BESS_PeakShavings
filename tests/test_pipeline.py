@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.bess_forecasting import asymmetric_metrics, load_and_prepare
+from src.bess_forecasting import asymmetric_metrics, evaluate_holdout, load_and_prepare
 
 
 DATA = Path(__file__).parents[1] / "load_timeseries_2025_case_study.csv"
@@ -21,3 +21,10 @@ def test_asymmetric_metric_penalizes_underforecast_more():
     under = pd.Series([90.0, 90.0])
     over = pd.Series([110.0, 110.0])
     assert asymmetric_metrics(actual, under)["weighted_absolute_error_kw"] > asymmetric_metrics(actual, over)["weighted_absolute_error_kw"]
+
+
+def test_horizon_evaluation_starts_after_forecast_origin():
+    frame = load_and_prepare(DATA)
+    metrics = evaluate_holdout(frame)
+    counts = metrics.groupby("horizon_15min")["n"].first()
+    assert counts.loc[1] > counts.loc[4] > counts.loc[16]
