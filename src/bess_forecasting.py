@@ -9,10 +9,17 @@ SLOTS_PER_DAY = 96
 SLOTS_PER_WEEK = 7 * SLOTS_PER_DAY
 
 
-def initialize_case(root: str | Path) -> tuple[Path, Path, Path, pd.DataFrame, pd.DataFrame]:
+def initialize_case(root: str | Path, input_path: str | Path | None = None) -> tuple[Path, Path, Path, pd.DataFrame, pd.DataFrame]:
     """Load the case data and return paths, prepared data, and raw data."""
     root = Path(root)
-    data_path = root / "load_timeseries_2025_case_study.csv"
+    if input_path is not None:
+        data_path = Path(input_path)
+    else:
+        candidates = (
+            root / "load_timeseries_2025_case_study.csv",
+            root / "case_inputs" / "load_timeseries_2025_case_study.csv",
+        )
+        data_path = next((path for path in candidates if path.exists()), candidates[0])
     output_dir = root / "outputs"
     plot_dir = output_dir / "plots"
     frame = add_calendar_features(load_and_prepare(data_path))
@@ -62,6 +69,21 @@ def add_calendar_features(frame: pd.DataFrame) -> pd.DataFrame:
     result["day_of_week"] = result.index.dayofweek
     result["lag_day_kw"] = result["load_kw"].shift(SLOTS_PER_DAY)
     result["lag_week_kw"] = result["load_kw"].shift(SLOTS_PER_WEEK)
+    return result
+
+
+def build_regression_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build load-only, leakage-safe calendar, lag, and rolling features."""
+    result = add_german_holiday_flag(frame)
+    slots = result.index.hour * 4 + result.index.minute // 15
+    result["hour_sin"] = np.sin(2 * np.pi * slots / SLOTS_PER_DAY)
+    result["hour_cos"] = np.cos(2 * np.pi * slots / SLOTS_PER_DAY)
+    result["weekday_flag"] = (result.index.dayofweek < 5).astype(float)
+    result["holiday_flag"] = result["is_public_holiday"].astype(float)
+    for lag in (1, 4, SLOTS_PER_DAY, SLOTS_PER_WEEK):
+        result[f"lag_{lag}_kw"] = result["load_kw"].shift(lag)
+    result["rolling_1h_mean_kw"] = result["load_kw"].shift(1).rolling(4).mean()
+    result["rolling_24h_mean_kw"] = result["load_kw"].shift(1).rolling(SLOTS_PER_DAY).mean()
     return result
 
 
@@ -291,6 +313,55 @@ def run_regression_baseline(frame: pd.DataFrame) -> tuple[dict[str, float], pd.S
     return score, pd.Series(coefficients, index=["intercept"] + columns).sort_values(key=abs, ascending=False)
 
 
+def run_ridge_baseline(
+    frame: pd.DataFrame,
+    alpha: float = 10.0,
+    train_end: pd.Timestamp | None = None,
+    eval_start: pd.Timestamp | None = None,
+    eval_end: pd.Timestamp | None = None,
+) -> tuple[dict[str, float], pd.Series]:
+    """Fit a small standardized ridge model using only pre-holdout data."""
+    data = build_regression_features(frame)
+    cutoff = train_end or (frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15))
+    evaluation_start = eval_start or cutoff
+    evaluation_end = eval_end or frame.index.max()
+    columns = [column for column in data.columns if column.startswith(("lag_", "rolling_"))] + ["hour_sin", "hour_cos", "weekday_flag", "holiday_flag"]
+    data = data.dropna(subset=["load_kw"] + columns)
+    train = data.index < cutoff
+    mean = data.loc[train, columns].mean()
+    scale = data.loc[train, columns].std().replace(0, 1)
+    x_train = (data.loc[train, columns] - mean) / scale
+    x_all = (data[columns] - mean) / scale
+    design_train = np.c_[np.ones(len(x_train)), x_train.to_numpy()]
+    penalty = np.diag([0.0] + [alpha] * len(columns))
+    coefficients = np.linalg.solve(design_train.T @ design_train + penalty, design_train.T @ data.loc[train, "load_kw"].to_numpy())
+    prediction = pd.Series(np.c_[np.ones(len(x_all)), x_all.to_numpy()] @ coefficients, index=data.index)
+    evaluation = (data.index >= evaluation_start) & (data.index <= evaluation_end)
+    score = asymmetric_metrics(data.loc[evaluation, "load_kw"], prediction.loc[evaluation])
+    return score, pd.Series(coefficients[1:], index=columns).sort_values(key=abs, ascending=False)
+
+
+def evaluate_rolling_validation(frame: pd.DataFrame, folds: int = 3, validation_days: int = 28) -> pd.DataFrame:
+    """Evaluate retained baselines over several chronological validation windows."""
+    rows: list[dict[str, float | int | str]] = []
+    last_target = frame.index.max()
+    for fold in range(1, folds + 1):
+        validation_end = last_target - pd.Timedelta(days=validation_days * (fold - 1))
+        cutoff = validation_end - pd.Timedelta(days=validation_days) + pd.Timedelta(minutes=15)
+        target_index = frame.index[(frame.index >= cutoff) & (frame.index <= validation_end)]
+        actual = frame["load_kw"].reindex(target_index)
+        eligible = frame["is_scoring_eligible"].reindex(target_index).fillna(False)
+        forecasts = {
+            "weekly_seasonal_naive": seasonal_forecast(frame, train_end=cutoff),
+            "conservative_q80": seasonal_forecast(frame, residual_quantile=.8, train_end=cutoff),
+        }
+        for name, forecast in forecasts.items():
+            rows.append({"fold": fold, "model": name, **asymmetric_metrics(actual[eligible], forecast.reindex(target_index)[eligible])})
+        ridge_score, _ = run_ridge_baseline(frame.loc[:validation_end], train_end=cutoff, eval_start=cutoff, eval_end=validation_end)
+        rows.append({"fold": fold, "model": "ridge_load_calendar", **ridge_score})
+    return pd.DataFrame(rows)
+
+
 def dispatch(load_kw: pd.Series, forecast_kw: pd.Series, threshold_kw: float = 80.0, battery_kwh: float = 100.0, power_kw: float = 50.0, efficiency: float = .92, initial_soc_kwh: float | None = None) -> pd.DataFrame:
     """Clip forecasted load above a threshold with explicit SOC tracking."""
     load_kw = pd.Series(load_kw).astype(float)
@@ -328,6 +399,8 @@ def run_forecast_analysis(frame: pd.DataFrame, output_dir: str | Path) -> dict[s
     """Run holdout scoring, regression comparison, and saved forecast plots."""
     metrics = evaluate_holdout(frame)
     regression_metrics, coefficients = run_regression_baseline(frame)
+    ridge_metrics, ridge_coefficients = run_ridge_baseline(frame)
+    rolling_metrics = evaluate_rolling_validation(frame)
     paths = plot_forecast_comparison(frame, metrics, output_dir)
     cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
     start = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
@@ -338,6 +411,9 @@ def run_forecast_analysis(frame: pd.DataFrame, output_dir: str | Path) -> dict[s
         "metrics": metrics,
         "regression_metrics": regression_metrics,
         "coefficients": coefficients,
+        "ridge_metrics": ridge_metrics,
+        "ridge_coefficients": ridge_coefficients,
+        "rolling_metrics": rolling_metrics,
         "plot_paths": paths,
         "actual": actual,
         "forecast": forecast,

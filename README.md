@@ -6,11 +6,11 @@ This case study builds an interpretable 15-minute load forecasting baseline for 
 
 ```powershell
 python -m pip install -r requirements.txt
-python main.py
+python main.py --input case_inputs/load_timeseries_2025_case_study.csv --output-dir outputs
 pytest -q
 ```
 
-Outputs are written to `outputs/`: the prepared dataset, EDA summary, holdout metrics, and saved figures under `outputs/plots/`. The notebook `bess_peak_shaving_case_study.ipynb` presents the narrative analysis and visualizations.
+Outputs are written to `outputs/`: the prepared dataset, EDA summary, holdout metrics, rolling-validation metrics, dispatch scenarios, dispatch simulation, and saved figures under `outputs/plots/`. The notebook `bess_peak_shaving_case_study.ipynb` presents the narrative analysis and visualizations.
 
 For readability, the headline metrics use the complete final 56-day chronological holdout, including holidays (15. Nov - 31. Dec). The forecast comparison graphic uses the first complete Monday-Sunday week in the holdout selected by calendar and data availability, without using its load values to choose the example.
 
@@ -18,4 +18,8 @@ For readability, the headline metrics use the complete final 56-day chronologica
 
 The validation set is the final 56 calendar days, preserving temporal order. Metrics include MAE/RMSE for scale, under-forecast rate, peak under-forecast rate, and a cost-weighted absolute error that assigns twice the weight to under-forecasting. The production recommendation is receding-horizon operation: refresh a 15-minute to 4-hour forecast at each interval, use the conservative estimate to protect a demand-charge threshold, and retain a reserve for forecast error.
 
-The baseline intentionally excludes weather, customer production schedules, and site-specific tariff data. German holiday flags are available as features, horizon scoring uses rolling forecast origins, and the dispatch demo tracks SOC with simple illustrative opportunity cost. The highest-value next additions are site-specific tariff rules, production schedules, market prices, and a fuller rolling backtest across multiple validation windows.
+The retained baselines are weekly seasonal-naive and conservative q80; a load-only ridge model is an attainable challenger using short lags, daily/weekly lags, rolling means, calendar variables, and German holiday flags. Validation uses multiple chronological windows and the headline final holdout.
+
+See [model_research.md](model_research.md) for the model-family comparison, expected accuracy, advantages, drawbacks, peak-risk fit, and the client information that would change the ranking.
+
+Future development depends on client information that is not available in this case: site operating schedules and planned shutdowns, holiday calendars specific to the customer, battery power/energy/SOC history, demand-charge tariff and billing windows, submetered process loads, weather if relevant to the process, and market prices for valuing arbitrage opportunity cost. These should be added only with time-aware validation and client-specific cost weights.

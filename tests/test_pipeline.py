@@ -5,7 +5,10 @@ import pandas as pd
 from src.bess_forecasting import asymmetric_metrics, dispatch, evaluate_holdout, load_and_prepare
 
 
-DATA = Path(__file__).parents[1] / "load_timeseries_2025_case_study.csv"
+ROOT = Path(__file__).parents[1]
+DATA = ROOT / "load_timeseries_2025_case_study.csv"
+if not DATA.exists():
+    DATA = ROOT / "case_inputs" / "load_timeseries_2025_case_study.csv"
 
 
 def test_prepare_parses_locale_and_preserves_valid_zeros():
