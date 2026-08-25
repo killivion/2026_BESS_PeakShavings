@@ -9,6 +9,18 @@ SLOTS_PER_DAY = 96
 SLOTS_PER_WEEK = 7 * SLOTS_PER_DAY
 
 
+def initialize_case(root: str | Path) -> tuple[Path, Path, Path, pd.DataFrame, pd.DataFrame]:
+    """Load the case data and return paths, prepared data, and raw data."""
+    root = Path(root)
+    data_path = root / "load_timeseries_2025_case_study.csv"
+    output_dir = root / "outputs"
+    plot_dir = output_dir / "plots"
+    frame = add_calendar_features(load_and_prepare(data_path))
+    raw = pd.read_csv(data_path, sep=";", decimal=",")
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    return data_path, output_dir, plot_dir, frame, raw
+
+
 def load_and_prepare(path: str | Path) -> pd.DataFrame:
     """Parse the German-locale input and regularize it to a 15-minute grid.
 
@@ -102,10 +114,17 @@ def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFram
     rows: list[dict[str, float | str]] = []
     for horizon in (1, 4, 16):
         for quantile, label in ((0.0, "weekly_seasonal_naive"), (0.8, "conservative_q80")):
-            forecast = seasonal_forecast(frame, horizon, quantile, cutoff)
-            target_start = cutoff + pd.Timedelta(minutes=15 * horizon)
-            mask = (frame.index >= target_start) & frame["is_scoring_eligible"]
-            metrics = asymmetric_metrics(frame.loc[mask, "load_kw"], forecast.loc[mask])
+            origins = frame.index[(frame.index >= cutoff) & (frame.index <= frame.index.max() - pd.Timedelta(minutes=15 * horizon))]
+            target_index = origins + pd.Timedelta(minutes=15 * horizon)
+            source_index = target_index - pd.Timedelta(days=7)
+            forecast = pd.Series(frame["load_kw"].reindex(source_index).to_numpy(), index=target_index)
+            if quantile:
+                history = frame.loc[frame.index < cutoff, "load_kw"]
+                uplift = (history - history.shift(SLOTS_PER_WEEK)).dropna().quantile(quantile)
+                forecast = forecast + uplift
+            actual = frame["load_kw"].reindex(target_index)
+            eligible = frame["is_scoring_eligible"].reindex(target_index).fillna(False)
+            metrics = asymmetric_metrics(actual[eligible], forecast[eligible])
             rows.append({"horizon_15min": horizon, "model": label, **metrics})
     return pd.DataFrame(rows)
 
@@ -272,15 +291,22 @@ def run_regression_baseline(frame: pd.DataFrame) -> tuple[dict[str, float], pd.S
     return score, pd.Series(coefficients, index=["intercept"] + columns).sort_values(key=abs, ascending=False)
 
 
-def dispatch(load_kw: pd.Series, forecast_kw: pd.Series, threshold_kw: float = 80.0, battery_kwh: float = 100.0, power_kw: float = 50.0, efficiency: float = .92) -> pd.DataFrame:
-    """Clip forecasted load above a threshold subject to simple battery limits."""
+def dispatch(load_kw: pd.Series, forecast_kw: pd.Series, threshold_kw: float = 80.0, battery_kwh: float = 100.0, power_kw: float = 50.0, efficiency: float = .92, initial_soc_kwh: float | None = None) -> pd.DataFrame:
+    """Clip forecasted load above a threshold with explicit SOC tracking."""
     load_kw = pd.Series(load_kw).astype(float)
     forecast_kw = pd.Series(forecast_kw, index=load_kw.index).astype(float)
-    dispatch_kw = np.minimum(np.maximum(forecast_kw - threshold_kw, 0), power_kw)
-    dispatch_kw = np.minimum(dispatch_kw, load_kw.clip(lower=0))
-    energy_used = dispatch_kw * .25 / efficiency
-    dispatch_kw = dispatch_kw.where(energy_used.cumsum() <= battery_kwh, 0.0)
-    return pd.DataFrame({"load_kw": load_kw, "forecast_kw": forecast_kw, "discharge_kw": dispatch_kw, "net_load_kw": load_kw - dispatch_kw})
+    soc = battery_kwh if initial_soc_kwh is None else min(initial_soc_kwh, battery_kwh)
+    rows = []
+    for timestamp in load_kw.index:
+        requested_kw = min(max(forecast_kw.loc[timestamp] - threshold_kw, 0), power_kw)
+        requested_kw = min(requested_kw, max(load_kw.loc[timestamp], 0))
+        max_from_soc_kw = soc * efficiency / .25
+        discharge_kw = min(requested_kw, max_from_soc_kw)
+        energy_from_soc = discharge_kw * .25 / efficiency
+        soc -= energy_from_soc
+        rows.append((timestamp, discharge_kw, soc))
+    dispatch_data = pd.DataFrame(rows, columns=["timestamp", "discharge_kw", "soc_kwh"]).set_index("timestamp")
+    return pd.DataFrame({"load_kw": load_kw, "forecast_kw": forecast_kw}).join(dispatch_data).assign(net_load_kw=lambda data: data["load_kw"] - data["discharge_kw"], energy_discharged_kwh=lambda data: data["discharge_kw"] * .25)
 
 
 def run_dispatch_demo(frame: pd.DataFrame, forecast: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -291,6 +317,9 @@ def run_dispatch_demo(frame: pd.DataFrame, forecast: pd.Series) -> tuple[pd.Data
     actual = frame.loc[start:end, "load_kw"]
     simulation = dispatch(actual, forecast.loc[actual.index])
     thresholds = pd.DataFrame({"threshold_kw": [70, 80, 90], "risk_posture": ["aggressive protection", "balanced", "arbitrage preserving"]})
+    thresholds["peak_after_dispatch_kw"] = [dispatch(actual, forecast.loc[actual.index], threshold).net_load_kw.max() for threshold in thresholds["threshold_kw"]]
+    thresholds["energy_discharged_kwh"] = [dispatch(actual, forecast.loc[actual.index], threshold).energy_discharged_kwh.sum() for threshold in thresholds["threshold_kw"]]
+    thresholds["illustrative_arbitrage_value_eur"] = thresholds["energy_discharged_kwh"] * 0.10
     thresholds["rule"] = thresholds.apply(lambda row: f"Weekdays 08:00-18:00: clip forecast above {row.threshold_kw} kW ({row.risk_posture})", axis=1)
     return simulation, thresholds
 
