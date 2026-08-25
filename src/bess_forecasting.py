@@ -98,7 +98,10 @@ def seasonal_forecast(
     # the evaluator; the comparable seasonal benchmark remains one week lagged.
     base = frame["load_kw"].shift(SLOTS_PER_WEEK)
     if residual_quantile:
-        history = frame.loc[frame.index < train_end, "load_kw"] if train_end is not None else frame["load_kw"]
+        history_mask = frame["is_scoring_eligible"]
+        if train_end is not None:
+            history_mask = history_mask & (frame.index < train_end)
+        history = frame["load_kw"].where(history_mask)
         residual = history - history.shift(SLOTS_PER_WEEK)
         uplift = residual.dropna().quantile(residual_quantile)
     else:
@@ -106,12 +109,18 @@ def seasonal_forecast(
     return base + uplift
 
 
-def asymmetric_metrics(actual: pd.Series, forecast: pd.Series, peak_quantile: float = 0.90) -> dict[str, float]:
+def asymmetric_metrics(
+    actual: pd.Series,
+    forecast: pd.Series,
+    peak_quantile: float = 0.90,
+    peak_cutoff_kw: float | None = None,
+) -> dict[str, float]:
     aligned = pd.concat([actual.rename("actual"), forecast.rename("forecast")], axis=1).dropna()
     error = aligned["forecast"] - aligned["actual"]
     under = error < 0
-    peak_cutoff = aligned["actual"].quantile(peak_quantile)
+    peak_cutoff = peak_cutoff_kw if peak_cutoff_kw is not None else aligned["actual"].quantile(peak_quantile)
     peak = aligned["actual"] >= peak_cutoff
+    peak_hits = (aligned["forecast"] >= peak_cutoff) & peak
     return {
         "n": float(len(aligned)),
         "mae_kw": float(error.abs().mean()),
@@ -119,10 +128,22 @@ def asymmetric_metrics(actual: pd.Series, forecast: pd.Series, peak_quantile: fl
         "underforecast_rate": float(under.mean()),
         "underforecast_mae_kw": float((-error[under]).mean()) if under.any() else 0.0,
         "peak_underforecast_rate": float((under & peak).sum() / peak.sum()) if peak.any() else 0.0,
+        "peak_recall": float(peak_hits.sum() / peak.sum()) if peak.any() else 0.0,
         "peak_underforecast_mae_kw": float((-error[under & peak]).mean()) if (under & peak).any() else 0.0,
+        "peak_forecast_bias_kw": float(error[peak].mean()) if peak.any() else 0.0,
         "weighted_absolute_error_kw": float((error.abs() * np.where(error < 0, 2.0, 1.0)).mean()),
         "peak_cutoff_kw": float(peak_cutoff),
     }
+
+
+def summarize_rolling_metrics(rolling_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Average fold-level metrics for a side-by-side model comparison."""
+    numeric_columns = rolling_metrics.select_dtypes(include="number").columns.difference(["fold", "n"])
+    summary = rolling_metrics.groupby("model", as_index=False)[numeric_columns].mean()
+    folds = rolling_metrics.groupby("model", as_index=False)["fold"].nunique().rename(columns={"fold": "folds"})
+    observations = rolling_metrics.groupby("model", as_index=False)["n"].sum()
+    observations = observations.rename(columns={"n": "observations"})
+    return summary.merge(folds, on="model").merge(observations, on="model")
 
 
 def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFrame:
@@ -133,6 +154,8 @@ def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFram
     labels from scoring exactly the same target set.
     """
     cutoff = frame.index.max() - pd.Timedelta(days=holdout_days) + pd.Timedelta(minutes=15)
+    training_load = frame.loc[(frame.index < cutoff) & frame["is_scoring_eligible"], "load_kw"]
+    peak_cutoff = float(training_load.quantile(.90))
     rows: list[dict[str, float | str]] = []
     for horizon in (1, 4, 16):
         for quantile, label in ((0.0, "weekly_seasonal_naive"), (0.8, "conservative_q80")):
@@ -141,12 +164,12 @@ def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFram
             source_index = target_index - pd.Timedelta(days=7)
             forecast = pd.Series(frame["load_kw"].reindex(source_index).to_numpy(), index=target_index)
             if quantile:
-                history = frame.loc[frame.index < cutoff, "load_kw"]
+                history = frame["load_kw"].where((frame.index < cutoff) & frame["is_scoring_eligible"])
                 uplift = (history - history.shift(SLOTS_PER_WEEK)).dropna().quantile(quantile)
                 forecast = forecast + uplift
             actual = frame["load_kw"].reindex(target_index)
             eligible = frame["is_scoring_eligible"].reindex(target_index).fillna(False)
-            metrics = asymmetric_metrics(actual[eligible], forecast[eligible])
+            metrics = asymmetric_metrics(actual[eligible], forecast[eligible], peak_cutoff_kw=peak_cutoff)
             rows.append({"horizon_15min": horizon, "model": label, **metrics})
     return pd.DataFrame(rows)
 
@@ -246,8 +269,13 @@ def plot_eda(frame: pd.DataFrame, output_dir: str | Path) -> tuple[Path, Path]:
     return first, second
 
 
-def plot_forecast_comparison(frame: pd.DataFrame, metrics: pd.DataFrame, output_dir: str | Path) -> tuple[Path, Path]:
-    """Save horizon error and a predeclared holdout-week comparison."""
+def plot_forecast_comparison(
+    frame: pd.DataFrame,
+    metrics: pd.DataFrame,
+    output_dir: str | Path,
+    rolling_metrics: pd.DataFrame | None = None,
+) -> tuple[Path, ...]:
+    """Save validation error, model comparison, and a holdout-week comparison."""
     import matplotlib.pyplot as plt
 
     cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
@@ -262,9 +290,12 @@ def plot_forecast_comparison(frame: pd.DataFrame, metrics: pd.DataFrame, output_
     actual = frame.loc[comparison_start:comparison_end, "load_kw"]
     naive = seasonal_forecast(frame, 1, 0.0, cutoff).loc[actual.index]
     conservative = seasonal_forecast(frame, 1, .8, cutoff).loc[actual.index]
+    model_order = ["weekly_seasonal_naive", "conservative_q80", "ridge_load_calendar"]
     horizon = metrics.groupby(["horizon_15min", "model"], as_index=False).weighted_absolute_error_kw.first()
+    horizon["model"] = pd.Categorical(horizon["model"], categories=model_order, ordered=True)
+    horizon = horizon.sort_values(["horizon_15min", "model"])
     fig, axis = plt.subplots(figsize=(8, 4))
-    for name, group in horizon.groupby("model"):
+    for name, group in horizon.groupby("model", observed=True):
         axis.plot(group.horizon_15min * 15 / 60, group.weighted_absolute_error_kw, marker="o", label=name)
     axis.set_xticks([.25, 1, 4], ["15m", "1h", "4h"])
     axis.set_xlabel("Forecast horizon")
@@ -272,6 +303,26 @@ def plot_forecast_comparison(frame: pd.DataFrame, metrics: pd.DataFrame, output_
     axis.set_title("Error trade-off by operational horizon")
     axis.legend()
     first = save_plot(fig, output_dir, "03_horizon_error_tradeoff.png")
+    paths = [first]
+    if rolling_metrics is not None:
+        rolling_summary = rolling_metrics.groupby("model", as_index=False)[
+            ["mae_kw", "peak_recall"]
+        ].mean()
+        rolling_summary["model"] = pd.Categorical(rolling_summary["model"], categories=model_order, ordered=True)
+        rolling_summary = rolling_summary.sort_values("model")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+        colors = {"weekly_seasonal_naive": "#377eb8", "conservative_q80": "#e41a1c", "ridge_load_calendar": "#1b9e77"}
+        axes[0].bar(rolling_summary["model"], rolling_summary["mae_kw"], color=[colors[name] for name in rolling_summary["model"]])
+        axes[0].set_title("Average rolling-fold MAE")
+        axes[0].set_ylabel("MAE (kW)")
+        axes[1].bar(rolling_summary["model"], rolling_summary["peak_recall"], color=[colors[name] for name in rolling_summary["model"]])
+        axes[1].set_title("Average rolling-fold peak recall")
+        axes[1].set_ylabel("Recall")
+        axes[1].set_ylim(0, 1)
+        for axis in axes:
+            axis.tick_params(axis="x", labelrotation=25)
+        comparison_path = save_plot(fig, output_dir, "05_rolling_model_comparison.png")
+        paths.append(comparison_path)
     fig, axis = plt.subplots(figsize=(14, 4))
     actual.plot(ax=axis, color="black", lw=1, label="actual")
     naive.plot(ax=axis, color="#377eb8", alpha=.8, label="weekly naive")
@@ -280,7 +331,8 @@ def plot_forecast_comparison(frame: pd.DataFrame, metrics: pd.DataFrame, output_
     axis.set_title(f"Predeclared holdout week: {comparison_start:%d %b} to {comparison_end:%d %b %Y}")
     axis.legend()
     second = save_plot(fig, output_dir, "04_typical_week_forecast_comparison.png")
-    return first, second
+    paths.append(second)
+    return tuple(paths)
 
 
 def add_german_holiday_flag(frame: pd.DataFrame) -> pd.DataFrame:
@@ -304,12 +356,17 @@ def run_regression_baseline(frame: pd.DataFrame) -> tuple[dict[str, float], pd.S
     features["weekday"] = (frame.index.dayofweek < 5).astype(int)
     model_data = features.dropna()
     cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
-    train = model_data.index < cutoff
+    train = (model_data.index < cutoff) & frame.loc[model_data.index, "is_scoring_eligible"].to_numpy()
     columns = ["lag_day_kw", "lag_week_kw", "hour_sin", "hour_cos", "weekday"]
     design_train = np.c_[np.ones(train.sum()), model_data.loc[train, columns]]
     coefficients = np.linalg.lstsq(design_train, model_data.loc[train, "load_kw"], rcond=None)[0]
     prediction = pd.Series(np.c_[np.ones(len(model_data)), model_data[columns]] @ coefficients, index=model_data.index)
-    score = asymmetric_metrics(model_data.loc[model_data.index >= cutoff, "load_kw"], prediction.loc[prediction.index >= cutoff])
+    peak_cutoff = float(model_data.loc[train, "load_kw"].quantile(.90))
+    score = asymmetric_metrics(
+        model_data.loc[model_data.index >= cutoff, "load_kw"],
+        prediction.loc[prediction.index >= cutoff],
+        peak_cutoff_kw=peak_cutoff,
+    )
     return score, pd.Series(coefficients, index=["intercept"] + columns).sort_values(key=abs, ascending=False)
 
 
@@ -327,7 +384,7 @@ def run_ridge_baseline(
     evaluation_end = eval_end or frame.index.max()
     columns = [column for column in data.columns if column.startswith(("lag_", "rolling_"))] + ["hour_sin", "hour_cos", "weekday_flag", "holiday_flag"]
     data = data.dropna(subset=["load_kw"] + columns)
-    train = data.index < cutoff
+    train = (data.index < cutoff) & frame.loc[data.index, "is_scoring_eligible"].to_numpy()
     mean = data.loc[train, columns].mean()
     scale = data.loc[train, columns].std().replace(0, 1)
     x_train = (data.loc[train, columns] - mean) / scale
@@ -336,8 +393,13 @@ def run_ridge_baseline(
     penalty = np.diag([0.0] + [alpha] * len(columns))
     coefficients = np.linalg.solve(design_train.T @ design_train + penalty, design_train.T @ data.loc[train, "load_kw"].to_numpy())
     prediction = pd.Series(np.c_[np.ones(len(x_all)), x_all.to_numpy()] @ coefficients, index=data.index)
-    evaluation = (data.index >= evaluation_start) & (data.index <= evaluation_end)
-    score = asymmetric_metrics(data.loc[evaluation, "load_kw"], prediction.loc[evaluation])
+    evaluation = (
+        (data.index >= evaluation_start)
+        & (data.index <= evaluation_end)
+        & frame.loc[data.index, "is_scoring_eligible"].to_numpy()
+    )
+    peak_cutoff = float(data.loc[train, "load_kw"].quantile(.90))
+    score = asymmetric_metrics(data.loc[evaluation, "load_kw"], prediction.loc[evaluation], peak_cutoff_kw=peak_cutoff)
     return score, pd.Series(coefficients[1:], index=columns).sort_values(key=abs, ascending=False)
 
 
@@ -351,12 +413,14 @@ def evaluate_rolling_validation(frame: pd.DataFrame, folds: int = 3, validation_
         target_index = frame.index[(frame.index >= cutoff) & (frame.index <= validation_end)]
         actual = frame["load_kw"].reindex(target_index)
         eligible = frame["is_scoring_eligible"].reindex(target_index).fillna(False)
+        training_load = frame.loc[(frame.index < cutoff) & frame["is_scoring_eligible"], "load_kw"]
+        peak_cutoff = float(training_load.quantile(.90))
         forecasts = {
             "weekly_seasonal_naive": seasonal_forecast(frame, train_end=cutoff),
             "conservative_q80": seasonal_forecast(frame, residual_quantile=.8, train_end=cutoff),
         }
         for name, forecast in forecasts.items():
-            rows.append({"fold": fold, "model": name, **asymmetric_metrics(actual[eligible], forecast.reindex(target_index)[eligible])})
+            rows.append({"fold": fold, "model": name, **asymmetric_metrics(actual[eligible], forecast.reindex(target_index)[eligible], peak_cutoff_kw=peak_cutoff)})
         ridge_score, _ = run_ridge_baseline(frame.loc[:validation_end], train_end=cutoff, eval_start=cutoff, eval_end=validation_end)
         rows.append({"fold": fold, "model": "ridge_load_calendar", **ridge_score})
     return pd.DataFrame(rows)
@@ -401,7 +465,7 @@ def run_forecast_analysis(frame: pd.DataFrame, output_dir: str | Path) -> dict[s
     regression_metrics, coefficients = run_regression_baseline(frame)
     ridge_metrics, ridge_coefficients = run_ridge_baseline(frame)
     rolling_metrics = evaluate_rolling_validation(frame)
-    paths = plot_forecast_comparison(frame, metrics, output_dir)
+    paths = plot_forecast_comparison(frame, metrics, output_dir, rolling_metrics)
     cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
     start = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
     end = start + pd.Timedelta(days=6, hours=23, minutes=45)
