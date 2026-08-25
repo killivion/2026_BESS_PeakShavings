@@ -1,0 +1,23 @@
+from pathlib import Path
+
+import pandas as pd
+
+from src.bess_forecasting import asymmetric_metrics, load_and_prepare
+
+
+DATA = Path(__file__).parents[1] / "load_timeseries_2025_case_study.csv"
+
+
+def test_prepare_parses_locale_and_preserves_valid_zeros():
+    frame = load_and_prepare(DATA)
+    assert frame.index.freq == pd.tseries.frequencies.to_offset("15min")
+    assert frame["load_kw"].eq(0).sum() > 3000
+    assert frame["load_kw_raw"].gt(200).sum() == 4
+    assert frame["was_interpolated"].sum() == 22
+
+
+def test_asymmetric_metric_penalizes_underforecast_more():
+    actual = pd.Series([100.0, 100.0])
+    under = pd.Series([90.0, 90.0])
+    over = pd.Series([110.0, 110.0])
+    assert asymmetric_metrics(actual, under)["weighted_absolute_error_kw"] > asymmetric_metrics(actual, over)["weighted_absolute_error_kw"]
