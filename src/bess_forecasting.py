@@ -171,6 +171,9 @@ def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFram
             eligible = frame["is_scoring_eligible"].reindex(target_index).fillna(False)
             metrics = asymmetric_metrics(actual[eligible], forecast[eligible], peak_cutoff_kw=peak_cutoff)
             rows.append({"horizon_15min": horizon, "model": label, **metrics})
+        ridge = ridge_forecast(frame, horizon_slots=horizon, train_end=cutoff, target_index=target_index)
+        ridge_metrics = asymmetric_metrics(actual[eligible], ridge[eligible], peak_cutoff_kw=peak_cutoff)
+        rows.append({"horizon_15min": horizon, "model": "ridge_load_calendar", **ridge_metrics})
     return pd.DataFrame(rows)
 
 
@@ -290,6 +293,7 @@ def plot_forecast_comparison(
     actual = frame.loc[comparison_start:comparison_end, "load_kw"]
     naive = seasonal_forecast(frame, 1, 0.0, cutoff).loc[actual.index]
     conservative = seasonal_forecast(frame, 1, .8, cutoff).loc[actual.index]
+    ridge = ridge_forecast(frame, horizon_slots=1, train_end=cutoff, target_index=actual.index)
     model_order = ["weekly_seasonal_naive", "conservative_q80", "ridge_load_calendar"]
     horizon = metrics.groupby(["horizon_15min", "model"], as_index=False).weighted_absolute_error_kw.first()
     horizon["model"] = pd.Categorical(horizon["model"], categories=model_order, ordered=True)
@@ -327,6 +331,7 @@ def plot_forecast_comparison(
     actual.plot(ax=axis, color="black", lw=1, label="actual")
     naive.plot(ax=axis, color="#377eb8", alpha=.8, label="weekly naive")
     conservative.plot(ax=axis, color="#e41a1c", alpha=.8, label="conservative q80")
+    ridge.plot(ax=axis, color="#1b9e77", alpha=.8, label="ridge load calendar")
     axis.set_ylabel("kW")
     axis.set_title(f"Predeclared holdout week: {comparison_start:%d %b} to {comparison_end:%d %b %Y}")
     axis.legend()
@@ -403,6 +408,34 @@ def run_ridge_baseline(
     return score, pd.Series(coefficients[1:], index=columns).sort_values(key=abs, ascending=False)
 
 
+def ridge_forecast(
+    frame: pd.DataFrame,
+    horizon_slots: int = 1,
+    train_end: pd.Timestamp | None = None,
+    target_index: pd.DatetimeIndex | None = None,
+) -> pd.Series:
+    """Forecast targets from origin features, fitting only before ``train_end``."""
+    data = build_regression_features(frame)
+    columns = [column for column in data.columns if column.startswith(("lag_", "rolling_"))] + ["hour_sin", "hour_cos", "weekday_flag", "holiday_flag"]
+    target = data["load_kw"].shift(-horizon_slots)
+    target_eligible = frame["is_scoring_eligible"].astype("boolean").shift(-horizon_slots).fillna(False).astype(bool)
+    data = data.assign(target=target, target_eligible=target_eligible).dropna(subset=columns + ["target"])
+    cutoff = train_end or (frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15))
+    train = (data.index < cutoff) & frame.loc[data.index, "is_scoring_eligible"].to_numpy() & data["target_eligible"].to_numpy()
+    mean = data.loc[train, columns].mean()
+    scale = data.loc[train, columns].std().replace(0, 1)
+    x_train = (data.loc[train, columns] - mean) / scale
+    x_all = (data[columns] - mean) / scale
+    design_train = np.c_[np.ones(len(x_train)), x_train.to_numpy()]
+    penalty = np.diag([0.0] + [10.0] * len(columns))
+    coefficients = np.linalg.solve(design_train.T @ design_train + penalty, design_train.T @ data.loc[train, "target"].to_numpy())
+    prediction = pd.Series(np.c_[np.ones(len(x_all)), x_all.to_numpy()] @ coefficients, index=data.index)
+    if target_index is None:
+        target_index = frame.index[frame.index >= cutoff]
+    origin_index = target_index - pd.Timedelta(minutes=15 * horizon_slots)
+    return prediction.reindex(origin_index).set_axis(target_index)
+
+
 def evaluate_rolling_validation(frame: pd.DataFrame, folds: int = 3, validation_days: int = 28) -> pd.DataFrame:
     """Evaluate retained baselines over several chronological validation windows."""
     rows: list[dict[str, float | int | str]] = []
@@ -418,11 +451,10 @@ def evaluate_rolling_validation(frame: pd.DataFrame, folds: int = 3, validation_
         forecasts = {
             "weekly_seasonal_naive": seasonal_forecast(frame, train_end=cutoff),
             "conservative_q80": seasonal_forecast(frame, residual_quantile=.8, train_end=cutoff),
+            "ridge_load_calendar": ridge_forecast(frame, horizon_slots=1, train_end=cutoff),
         }
         for name, forecast in forecasts.items():
             rows.append({"fold": fold, "model": name, **asymmetric_metrics(actual[eligible], forecast.reindex(target_index)[eligible], peak_cutoff_kw=peak_cutoff)})
-        ridge_score, _ = run_ridge_baseline(frame.loc[:validation_end], train_end=cutoff, eval_start=cutoff, eval_end=validation_end)
-        rows.append({"fold": fold, "model": "ridge_load_calendar", **ridge_score})
     return pd.DataFrame(rows)
 
 

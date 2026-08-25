@@ -7,6 +7,7 @@ from src.bess_forecasting import (
     dispatch,
     evaluate_holdout,
     load_and_prepare,
+    ridge_forecast,
     summarize_rolling_metrics,
 )
 
@@ -68,6 +69,17 @@ def test_horizon_evaluation_starts_after_forecast_origin():
     metrics = evaluate_holdout(frame)
     counts = metrics.groupby("horizon_15min")["n"].first()
     assert counts.loc[1] > counts.loc[4] > counts.loc[16]
+
+
+def test_ridge_is_evaluated_at_each_horizon_without_future_target_features():
+    frame = load_and_prepare(DATA)
+    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
+    target_index = pd.date_range(cutoff, periods=8, freq="15min")
+    forecast = ridge_forecast(frame, horizon_slots=4, train_end=cutoff, target_index=target_index)
+    assert forecast.index.equals(target_index)
+    assert forecast.notna().all()
+    scored = evaluate_holdout(frame)
+    assert set(scored.loc[scored["model"] == "ridge_load_calendar", "horizon_15min"]) == {1, 4, 16}
 
 
 def test_dispatch_respects_soc_and_energy_balance():
