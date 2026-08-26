@@ -7,6 +7,13 @@ import pandas as pd
 
 SLOTS_PER_DAY = 96
 SLOTS_PER_WEEK = 7 * SLOTS_PER_DAY
+HOLDOUT_DAYS = 56
+
+# Illustrative-only: no client tariff was supplied with this case. Germany's
+# demand-charge ("Leistungspreis") component commonly falls in this range for
+# a C&I connection; replace with the customer's actual grid-tariff rate.
+ILLUSTRATIVE_DEMAND_CHARGE_EUR_PER_KW_YEAR = 100.0
+ILLUSTRATIVE_ARBITRAGE_EUR_PER_KWH = 0.10
 
 
 def initialize_case(root: str | Path, input_path: str | Path | None = None) -> tuple[Path, Path, Path, pd.DataFrame, pd.DataFrame]:
@@ -22,7 +29,7 @@ def initialize_case(root: str | Path, input_path: str | Path | None = None) -> t
         data_path = next((path for path in candidates if path.exists()), candidates[0])
     output_dir = root / "outputs"
     plot_dir = output_dir / "plots"
-    frame = add_calendar_features(load_and_prepare(data_path))
+    frame = load_and_prepare(data_path)
     raw = pd.read_csv(data_path, sep=";", decimal=",")
     plot_dir.mkdir(parents=True, exist_ok=True)
     return data_path, output_dir, plot_dir, frame, raw
@@ -63,27 +70,44 @@ def load_and_prepare(path: str | Path) -> pd.DataFrame:
     return prepared
 
 
-def add_calendar_features(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.copy()
-    result["slot"] = result.index.hour * 4 + result.index.minute // 15
-    result["day_of_week"] = result.index.dayofweek
-    result["lag_day_kw"] = result["load_kw"].shift(SLOTS_PER_DAY)
-    result["lag_week_kw"] = result["load_kw"].shift(SLOTS_PER_WEEK)
-    return result
-
-
-def build_regression_features(frame: pd.DataFrame) -> pd.DataFrame:
-    """Build load-only, leakage-safe calendar, lag, and rolling features."""
+def _add_calendar_flags(frame: pd.DataFrame) -> pd.DataFrame:
+    """Time-of-day/weekday/holiday features shared by both feature sets below."""
     result = add_german_holiday_flag(frame)
     slots = result.index.hour * 4 + result.index.minute // 15
     result["hour_sin"] = np.sin(2 * np.pi * slots / SLOTS_PER_DAY)
     result["hour_cos"] = np.cos(2 * np.pi * slots / SLOTS_PER_DAY)
     result["weekday_flag"] = (result.index.dayofweek < 5).astype(float)
     result["holiday_flag"] = result["is_public_holiday"].astype(float)
+    return result
+
+
+def build_regression_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build load-only, leakage-safe calendar, lag, and rolling features.
+
+    Includes short-horizon lags (last 15/60 minutes), so this feature set is
+    only informative at the operational 15 min-4 h horizons -- see
+    ``build_day_ahead_features`` for horizons where those go stale.
+    """
+    result = _add_calendar_flags(frame)
     for lag in (1, 4, SLOTS_PER_DAY, SLOTS_PER_WEEK):
         result[f"lag_{lag}_kw"] = result["load_kw"].shift(lag)
     result["rolling_1h_mean_kw"] = result["load_kw"].shift(1).rolling(4).mean()
     result["rolling_24h_mean_kw"] = result["load_kw"].shift(1).rolling(SLOTS_PER_DAY).mean()
+    return result
+
+
+def build_day_ahead_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build calendar and seasonal-lag features that stay valid a day ahead.
+
+    Drops the short-horizon lags and rolling means from
+    ``build_regression_features``: "what happened in the last hour" carries
+    no signal 24 hours out. Keeps only same-day-yesterday (``lag_96_kw``),
+    same-time-last-week (``lag_672_kw``), and calendar features, none of
+    which depend on recent observations.
+    """
+    result = _add_calendar_flags(frame)
+    result["lag_96_kw"] = result["load_kw"].shift(SLOTS_PER_DAY)
+    result["lag_672_kw"] = result["load_kw"].shift(SLOTS_PER_WEEK)
     return result
 
 
@@ -146,14 +170,14 @@ def summarize_rolling_metrics(rolling_metrics: pd.DataFrame) -> pd.DataFrame:
     return summary.merge(folds, on="model").merge(observations, on="model")
 
 
-def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFrame:
+def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = HOLDOUT_DAYS) -> pd.DataFrame:
     """Evaluate target times reached from origins in the final time block.
 
     The seasonal lag is known at each forecast origin. For horizon ``h``, the
     first scored target is ``holdout_start + h``; this prevents the horizon
     labels from scoring exactly the same target set.
     """
-    cutoff = frame.index.max() - pd.Timedelta(days=holdout_days) + pd.Timedelta(minutes=15)
+    cutoff = holdout_cutoff(frame, holdout_days)
     training_load = frame.loc[(frame.index < cutoff) & frame["is_scoring_eligible"], "load_kw"]
     peak_cutoff = float(training_load.quantile(.90))
     rows: list[dict[str, float | str]] = []
@@ -161,12 +185,7 @@ def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFram
         for quantile, label in ((0.0, "weekly_seasonal_naive"), (0.8, "conservative_q80")):
             origins = frame.index[(frame.index >= cutoff) & (frame.index <= frame.index.max() - pd.Timedelta(minutes=15 * horizon))]
             target_index = origins + pd.Timedelta(minutes=15 * horizon)
-            source_index = target_index - pd.Timedelta(days=7)
-            forecast = pd.Series(frame["load_kw"].reindex(source_index).to_numpy(), index=target_index)
-            if quantile:
-                history = frame["load_kw"].where((frame.index < cutoff) & frame["is_scoring_eligible"])
-                uplift = (history - history.shift(SLOTS_PER_WEEK)).dropna().quantile(quantile)
-                forecast = forecast + uplift
+            forecast = seasonal_forecast(frame, horizon_slots=horizon, residual_quantile=quantile, train_end=cutoff).reindex(target_index)
             actual = frame["load_kw"].reindex(target_index)
             eligible = frame["is_scoring_eligible"].reindex(target_index).fillna(False)
             metrics = asymmetric_metrics(actual[eligible], forecast[eligible], peak_cutoff_kw=peak_cutoff)
@@ -174,6 +193,9 @@ def evaluate_holdout(frame: pd.DataFrame, holdout_days: int = 56) -> pd.DataFram
         ridge = ridge_forecast(frame, horizon_slots=horizon, train_end=cutoff, target_index=target_index)
         ridge_metrics = asymmetric_metrics(actual[eligible], ridge[eligible], peak_cutoff_kw=peak_cutoff)
         rows.append({"horizon_15min": horizon, "model": "ridge_load_calendar", **ridge_metrics})
+        gbm = gbm_quantile_forecast(frame, horizon_slots=horizon, quantile=0.8, train_end=cutoff, target_index=target_index)
+        gbm_metrics = asymmetric_metrics(actual[eligible], gbm[eligible], peak_cutoff_kw=peak_cutoff)
+        rows.append({"horizon_15min": horizon, "model": "gbm_quantile", **gbm_metrics})
     return pd.DataFrame(rows)
 
 
@@ -215,6 +237,41 @@ def select_representative_week(
     position = int(np.argmin(distances))
     end = weeks[position] + pd.Timedelta(days=6, hours=23, minutes=45)
     return weeks[position], end, float(distances[position])
+
+
+def holdout_cutoff(frame: pd.DataFrame, holdout_days: int = HOLDOUT_DAYS) -> pd.Timestamp:
+    """First scored timestamp of the chronological holdout block."""
+    return frame.index.max() - pd.Timedelta(days=holdout_days) + pd.Timedelta(minutes=15)
+
+
+def select_predeclared_holdout_week(
+    frame: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    search_start_offset_days: int = HOLDOUT_DAYS // 2,
+    search_limit: pd.Timestamp = pd.Timestamp("2025-12-15"),
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return the first complete Monday-Sunday week starting well inside the holdout.
+
+    The search begins ``search_start_offset_days`` after cutoff rather than
+    immediately at it: the week right next to the train/test boundary is the
+    most favorable position a frozen model's recency-based lag features can
+    be in, and would make results look stronger than a normal week deeper
+    into the holdout. Offsetting by half the holdout window keeps the week
+    a genuine mid-holdout example without reaching for a specific one.
+    Selected by calendar completeness alone, never by load values, so the
+    comparison week still cannot be cherry-picked to flatter or disadvantage
+    any model. Shared by every plot and demo that needs "the" holdout week,
+    so they always agree on which week that is -- including dispatch.
+    """
+    search_start = cutoff + pd.Timedelta(days=search_start_offset_days)
+    start = search_start + pd.Timedelta(days=(7 - search_start.dayofweek) % 7)
+    while start <= search_limit:
+        candidate_index = pd.date_range(start, periods=SLOTS_PER_WEEK, freq="15min")
+        if frame["load_kw"].reindex(candidate_index).notna().all():
+            break
+        start += pd.Timedelta(days=7)
+    end = start + pd.Timedelta(days=6, hours=23, minutes=45)
+    return start, end
 
 
 def save_plot(fig, output_dir: str | Path, filename: str) -> Path:
@@ -277,24 +334,25 @@ def plot_forecast_comparison(
     metrics: pd.DataFrame,
     output_dir: str | Path,
     rolling_metrics: pd.DataFrame | None = None,
+    ridge_week: pd.Series | None = None,
+    gbm_week: pd.Series | None = None,
 ) -> tuple[Path, ...]:
-    """Save validation error, model comparison, and a holdout-week comparison."""
+    """Save validation error, model comparison, and a holdout-week comparison.
+
+    ``ridge_week``/``gbm_week`` let a caller that already fit these models for
+    the same predeclared week (e.g. ``run_forecast_analysis``) pass the
+    forecasts through instead of paying for a second, redundant fit.
+    """
     import matplotlib.pyplot as plt
 
-    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
-    first_monday = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
-    comparison_start = first_monday
-    while comparison_start <= pd.Timestamp("2025-12-15"):
-        candidate_index = pd.date_range(comparison_start, periods=SLOTS_PER_WEEK, freq="15min")
-        if frame["load_kw"].reindex(candidate_index).notna().all():
-            break
-        comparison_start += pd.Timedelta(days=7)
-    comparison_end = comparison_start + pd.Timedelta(days=6, hours=23, minutes=45)
+    cutoff = holdout_cutoff(frame)
+    comparison_start, comparison_end = select_predeclared_holdout_week(frame, cutoff)
     actual = frame.loc[comparison_start:comparison_end, "load_kw"]
     naive = seasonal_forecast(frame, 1, 0.0, cutoff).loc[actual.index]
     conservative = seasonal_forecast(frame, 1, .8, cutoff).loc[actual.index]
-    ridge = ridge_forecast(frame, horizon_slots=1, train_end=cutoff, target_index=actual.index)
-    model_order = ["weekly_seasonal_naive", "conservative_q80", "ridge_load_calendar"]
+    ridge = ridge_week if ridge_week is not None else ridge_forecast(frame, horizon_slots=1, train_end=cutoff, target_index=actual.index)
+    gbm = gbm_week if gbm_week is not None else gbm_quantile_forecast(frame, horizon_slots=1, quantile=0.8, train_end=cutoff, target_index=actual.index)
+    model_order = ["weekly_seasonal_naive", "conservative_q80", "ridge_load_calendar", "gbm_quantile"]
     horizon = metrics.groupby(["horizon_15min", "model"], as_index=False).weighted_absolute_error_kw.first()
     horizon["model"] = pd.Categorical(horizon["model"], categories=model_order, ordered=True)
     horizon = horizon.sort_values(["horizon_15min", "model"])
@@ -315,7 +373,7 @@ def plot_forecast_comparison(
         rolling_summary["model"] = pd.Categorical(rolling_summary["model"], categories=model_order, ordered=True)
         rolling_summary = rolling_summary.sort_values("model")
         fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
-        colors = {"weekly_seasonal_naive": "#377eb8", "conservative_q80": "#e41a1c", "ridge_load_calendar": "#1b9e77"}
+        colors = {"weekly_seasonal_naive": "#377eb8", "conservative_q80": "#e41a1c", "ridge_load_calendar": "#1b9e77", "gbm_quantile": "#ff7f00"}
         axes[0].bar(rolling_summary["model"], rolling_summary["mae_kw"], color=[colors[name] for name in rolling_summary["model"]])
         axes[0].set_title("Average rolling-fold MAE")
         axes[0].set_ylabel("MAE (kW)")
@@ -327,14 +385,23 @@ def plot_forecast_comparison(
             axis.tick_params(axis="x", labelrotation=25)
         comparison_path = save_plot(fig, output_dir, "05_rolling_model_comparison.png")
         paths.append(comparison_path)
-    fig, axis = plt.subplots(figsize=(14, 4))
-    actual.plot(ax=axis, color="black", lw=1, label="actual")
-    naive.plot(ax=axis, color="#377eb8", alpha=.8, label="weekly naive")
-    conservative.plot(ax=axis, color="#e41a1c", alpha=.8, label="conservative q80")
-    ridge.plot(ax=axis, color="#1b9e77", alpha=.8, label="ridge load calendar")
-    axis.set_ylabel("kW")
-    axis.set_title(f"Predeclared holdout week: {comparison_start:%d %b} to {comparison_end:%d %b %Y}")
-    axis.legend()
+    # One panel per model (actual + that model only) instead of five lines
+    # stacked on one axis, so each forecast's behavior is easy to trace on
+    # its own rather than lost in overlapping color/alpha.
+    panels = [
+        ("Weekly seasonal-naive", naive, "#377eb8"),
+        ("Conservative q80", conservative, "#e41a1c"),
+        ("Ridge load + calendar", ridge, "#1b9e77"),
+        ("GBM quantile", gbm, "#ff7f00"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 7.5), sharex=True, sharey=True, constrained_layout=True)
+    for panel_axis, (name, series, color) in zip(axes.flat, panels):
+        actual.plot(ax=panel_axis, color="black", lw=1.1, label="actual")
+        series.plot(ax=panel_axis, color=color, lw=1.3, label=name)
+        panel_axis.set_title(name, fontsize=11)
+        panel_axis.set_ylabel("kW")
+        panel_axis.legend(loc="upper left", fontsize=8, framealpha=0.85)
+    fig.suptitle(f"Predeclared holdout week: {comparison_start:%d %b} to {comparison_end:%d %b %Y}")
     second = save_plot(fig, output_dir, "04_typical_week_forecast_comparison.png")
     paths.append(second)
     return tuple(paths)
@@ -353,61 +420,6 @@ def add_german_holiday_flag(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def run_regression_baseline(frame: pd.DataFrame) -> tuple[dict[str, float], pd.Series]:
-    """Fit the small calendar/lag regression on pre-holdout data only."""
-    features = frame[["load_kw", "lag_day_kw", "lag_week_kw"]].copy()
-    features["hour_sin"] = np.sin(2 * np.pi * frame.index.hour / 24)
-    features["hour_cos"] = np.cos(2 * np.pi * frame.index.hour / 24)
-    features["weekday"] = (frame.index.dayofweek < 5).astype(int)
-    model_data = features.dropna()
-    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
-    train = (model_data.index < cutoff) & frame.loc[model_data.index, "is_scoring_eligible"].to_numpy()
-    columns = ["lag_day_kw", "lag_week_kw", "hour_sin", "hour_cos", "weekday"]
-    design_train = np.c_[np.ones(train.sum()), model_data.loc[train, columns]]
-    coefficients = np.linalg.lstsq(design_train, model_data.loc[train, "load_kw"], rcond=None)[0]
-    prediction = pd.Series(np.c_[np.ones(len(model_data)), model_data[columns]] @ coefficients, index=model_data.index)
-    peak_cutoff = float(model_data.loc[train, "load_kw"].quantile(.90))
-    score = asymmetric_metrics(
-        model_data.loc[model_data.index >= cutoff, "load_kw"],
-        prediction.loc[prediction.index >= cutoff],
-        peak_cutoff_kw=peak_cutoff,
-    )
-    return score, pd.Series(coefficients, index=["intercept"] + columns).sort_values(key=abs, ascending=False)
-
-
-def run_ridge_baseline(
-    frame: pd.DataFrame,
-    alpha: float = 10.0,
-    train_end: pd.Timestamp | None = None,
-    eval_start: pd.Timestamp | None = None,
-    eval_end: pd.Timestamp | None = None,
-) -> tuple[dict[str, float], pd.Series]:
-    """Fit a small standardized ridge model using only pre-holdout data."""
-    data = build_regression_features(frame)
-    cutoff = train_end or (frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15))
-    evaluation_start = eval_start or cutoff
-    evaluation_end = eval_end or frame.index.max()
-    columns = [column for column in data.columns if column.startswith(("lag_", "rolling_"))] + ["hour_sin", "hour_cos", "weekday_flag", "holiday_flag"]
-    data = data.dropna(subset=["load_kw"] + columns)
-    train = (data.index < cutoff) & frame.loc[data.index, "is_scoring_eligible"].to_numpy()
-    mean = data.loc[train, columns].mean()
-    scale = data.loc[train, columns].std().replace(0, 1)
-    x_train = (data.loc[train, columns] - mean) / scale
-    x_all = (data[columns] - mean) / scale
-    design_train = np.c_[np.ones(len(x_train)), x_train.to_numpy()]
-    penalty = np.diag([0.0] + [alpha] * len(columns))
-    coefficients = np.linalg.solve(design_train.T @ design_train + penalty, design_train.T @ data.loc[train, "load_kw"].to_numpy())
-    prediction = pd.Series(np.c_[np.ones(len(x_all)), x_all.to_numpy()] @ coefficients, index=data.index)
-    evaluation = (
-        (data.index >= evaluation_start)
-        & (data.index <= evaluation_end)
-        & frame.loc[data.index, "is_scoring_eligible"].to_numpy()
-    )
-    peak_cutoff = float(data.loc[train, "load_kw"].quantile(.90))
-    score = asymmetric_metrics(data.loc[evaluation, "load_kw"], prediction.loc[evaluation], peak_cutoff_kw=peak_cutoff)
-    return score, pd.Series(coefficients[1:], index=columns).sort_values(key=abs, ascending=False)
-
-
 def ridge_forecast(
     frame: pd.DataFrame,
     horizon_slots: int = 1,
@@ -420,8 +432,13 @@ def ridge_forecast(
     target = data["load_kw"].shift(-horizon_slots)
     target_eligible = frame["is_scoring_eligible"].astype("boolean").shift(-horizon_slots).fillna(False).astype(bool)
     data = data.assign(target=target, target_eligible=target_eligible).dropna(subset=columns + ["target"])
-    cutoff = train_end or (frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15))
-    train = (data.index < cutoff) & frame.loc[data.index, "is_scoring_eligible"].to_numpy() & data["target_eligible"].to_numpy()
+    cutoff = train_end or holdout_cutoff(frame)
+    # Gate on the *target* time, not the origin: an origin just before cutoff
+    # with a multi-step horizon still has a target inside [cutoff, train_end),
+    # i.e. a label that would not exist yet at the moment this model is
+    # frozen for deployment. Excluding it keeps every horizon leakage-free.
+    target_time = data.index + pd.Timedelta(minutes=15 * horizon_slots)
+    train = (target_time < cutoff) & frame.loc[data.index, "is_scoring_eligible"].to_numpy() & data["target_eligible"].to_numpy()
     mean = data.loc[train, columns].mean()
     scale = data.loc[train, columns].std().replace(0, 1)
     x_train = (data.loc[train, columns] - mean) / scale
@@ -434,6 +451,109 @@ def ridge_forecast(
         target_index = frame.index[frame.index >= cutoff]
     origin_index = target_index - pd.Timedelta(minutes=15 * horizon_slots)
     return prediction.reindex(origin_index).set_axis(target_index)
+
+
+def _fit_gbm_quantile(
+    frame: pd.DataFrame,
+    data: pd.DataFrame,
+    columns: list[str],
+    horizon_slots: int,
+    quantile: float,
+    train_end: pd.Timestamp | None,
+    target_index: pd.DatetimeIndex | None,
+) -> pd.Series:
+    """Shared leakage-safe LightGBM quantile fit/predict routine.
+
+    Gates training on the *target* time, not the origin: an origin just
+    before cutoff with a multi-step horizon still has a target inside
+    ``[cutoff, train_end)``, i.e. a label that would not exist yet at the
+    moment this model is frozen for deployment. Excluding it keeps every
+    horizon and every feature set leakage-free.
+    """
+    import lightgbm as lgb
+
+    target = data["load_kw"].shift(-horizon_slots)
+    target_eligible = frame["is_scoring_eligible"].astype("boolean").shift(-horizon_slots).fillna(False).astype(bool)
+    data = data.assign(target=target, target_eligible=target_eligible).dropna(subset=columns + ["target"])
+    cutoff = train_end or holdout_cutoff(frame)
+    target_time = data.index + pd.Timedelta(minutes=15 * horizon_slots)
+    train = (target_time < cutoff) & frame.loc[data.index, "is_scoring_eligible"].to_numpy() & data["target_eligible"].to_numpy()
+
+    params = {
+        "objective": "quantile",
+        "alpha": quantile,
+        "learning_rate": 0.05,
+        "num_leaves": 15,
+        "min_data_in_leaf": 30,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "seed": 42,
+        "deterministic": True,
+        "force_row_wise": True,
+        "num_threads": 1,
+        "verbose": -1,
+    }
+    train_set = lgb.Dataset(data.loc[train, columns], label=data.loc[train, "target"])
+    booster = lgb.train(params, train_set, num_boost_round=300)
+    prediction = pd.Series(booster.predict(data[columns]), index=data.index)
+
+    if target_index is None:
+        target_index = frame.index[frame.index >= cutoff]
+    origin_index = target_index - pd.Timedelta(minutes=15 * horizon_slots)
+    return prediction.reindex(origin_index).set_axis(target_index)
+
+
+def gbm_quantile_forecast(
+    frame: pd.DataFrame,
+    horizon_slots: int = 1,
+    quantile: float = 0.8,
+    train_end: pd.Timestamp | None = None,
+    target_index: pd.DatetimeIndex | None = None,
+) -> pd.Series:
+    """Forecast a conservative quantile of load directly from origin features.
+
+    Same leakage-safe origin/target construction as ``ridge_forecast``, but
+    trained on pinball loss so the model targets the upper quantile itself
+    instead of shifting a mean forecast by a flat historical uplift. Uses
+    the operational feature set (short lags included) -- valid at 15 min-4 h
+    horizons; see ``gbm_day_ahead_forecast`` for longer horizons.
+    """
+    data = build_regression_features(frame)
+    columns = [column for column in data.columns if column.startswith(("lag_", "rolling_"))] + ["hour_sin", "hour_cos", "weekday_flag", "holiday_flag"]
+    return _fit_gbm_quantile(frame, data, columns, horizon_slots, quantile, train_end, target_index)
+
+
+def gbm_day_ahead_forecast(
+    frame: pd.DataFrame,
+    horizon_slots: int = SLOTS_PER_DAY,
+    quantile: float = 0.8,
+    train_end: pd.Timestamp | None = None,
+    target_index: pd.DatetimeIndex | None = None,
+) -> pd.Series:
+    """Fit a GBM quantile forecast using only day-ahead-valid features.
+
+    Same leakage-safe fit routine as ``gbm_quantile_forecast``, but built on
+    ``build_day_ahead_features`` (same-day-yesterday and same-time-last-week
+    lags plus calendar features only, no short lags) on the theory that
+    short-horizon features are stale a day out.
+
+    Tested at the 1-day horizon (96 slots), this does **not** solve
+    day-ahead forecasting: it underperforms both the operational feature
+    set and the trivial weekly-seasonal-naive baseline on every metric
+    (worse MAE, worse peak under-forecast rate). Dropping the short lags
+    removes real, if indirect, signal about the site's current operating
+    regime without anything of comparable value to replace it. Genuine
+    day-ahead accuracy needs additional inputs (weather, a production
+    schedule) or a different kind of approach (e.g. forecasting the day's
+    shape/peak risk rather than each 15-minute point), not a feature-set
+    change to the same short-horizon model. Kept here, tested, and
+    documented as evidence for that conclusion, not as a recommended
+    forecaster.
+    """
+    data = build_day_ahead_features(frame)
+    columns = [column for column in data.columns if column.startswith(("lag_", "rolling_"))] + ["hour_sin", "hour_cos", "weekday_flag", "holiday_flag"]
+    return _fit_gbm_quantile(frame, data, columns, horizon_slots, quantile, train_end, target_index)
 
 
 def evaluate_rolling_validation(frame: pd.DataFrame, folds: int = 3, validation_days: int = 28) -> pd.DataFrame:
@@ -452,74 +572,137 @@ def evaluate_rolling_validation(frame: pd.DataFrame, folds: int = 3, validation_
             "weekly_seasonal_naive": seasonal_forecast(frame, train_end=cutoff),
             "conservative_q80": seasonal_forecast(frame, residual_quantile=.8, train_end=cutoff),
             "ridge_load_calendar": ridge_forecast(frame, horizon_slots=1, train_end=cutoff),
+            "gbm_quantile": gbm_quantile_forecast(frame, horizon_slots=1, quantile=0.8, train_end=cutoff),
         }
         for name, forecast in forecasts.items():
             rows.append({"fold": fold, "model": name, **asymmetric_metrics(actual[eligible], forecast.reindex(target_index)[eligible], peak_cutoff_kw=peak_cutoff)})
     return pd.DataFrame(rows)
 
 
-def dispatch(load_kw: pd.Series, forecast_kw: pd.Series, threshold_kw: float = 80.0, battery_kwh: float = 100.0, power_kw: float = 50.0, efficiency: float = .92, initial_soc_kwh: float | None = None) -> pd.DataFrame:
-    """Clip forecasted load above a threshold with explicit SOC tracking."""
+def dispatch(load_kw: pd.Series, forecast_kw: pd.Series, threshold_kw: float = 80.0, battery_kwh: float = 100.0, power_kw: float = 50.0, efficiency: float = .92, initial_soc_kwh: float | None = None, charge_power_kw: float | None = None) -> pd.DataFrame:
+    """Charge below and discharge above a threshold with explicit SOC tracking."""
     load_kw = pd.Series(load_kw).astype(float)
     forecast_kw = pd.Series(forecast_kw, index=load_kw.index).astype(float)
+    charge_power_kw = power_kw if charge_power_kw is None else charge_power_kw
     soc = battery_kwh if initial_soc_kwh is None else min(initial_soc_kwh, battery_kwh)
     rows = []
     for timestamp in load_kw.index:
-        requested_kw = min(max(forecast_kw.loc[timestamp] - threshold_kw, 0), power_kw)
-        requested_kw = min(requested_kw, max(load_kw.loc[timestamp], 0))
+        forecast_at_timestamp = forecast_kw.loc[timestamp]
+        if pd.isna(forecast_at_timestamp):
+            # No forecast for this interval (e.g. a rolling-window feature
+            # crossed a data gap upstream): hold position rather than act on
+            # missing information. Critically, this keeps `soc` numeric --
+            # letting NaN through here would poison every later timestep,
+            # since `float('nan')` propagates through all subsequent
+            # arithmetic and Python's max(nan, 0) returns nan, not 0.
+            rows.append((timestamp, 0.0, 0.0, soc))
+            continue
+        requested_discharge_kw = min(max(forecast_at_timestamp - threshold_kw, 0), power_kw)
+        requested_discharge_kw = min(requested_discharge_kw, max(load_kw.loc[timestamp], 0))
         max_from_soc_kw = soc * efficiency / .25
-        discharge_kw = min(requested_kw, max_from_soc_kw)
+        discharge_kw = min(requested_discharge_kw, max_from_soc_kw)
         energy_from_soc = discharge_kw * .25 / efficiency
         soc -= energy_from_soc
-        rows.append((timestamp, discharge_kw, soc))
-    dispatch_data = pd.DataFrame(rows, columns=["timestamp", "discharge_kw", "soc_kwh"]).set_index("timestamp")
-    return pd.DataFrame({"load_kw": load_kw, "forecast_kw": forecast_kw}).join(dispatch_data).assign(net_load_kw=lambda data: data["load_kw"] - data["discharge_kw"], energy_discharged_kwh=lambda data: data["discharge_kw"] * .25)
+        forecast_headroom_kw = max(threshold_kw - forecast_at_timestamp, 0)
+        observed_headroom_kw = max(threshold_kw - load_kw.loc[timestamp], 0)
+        requested_charge_kw = min(forecast_headroom_kw, observed_headroom_kw, charge_power_kw)
+        max_into_soc_kw = max((battery_kwh - soc) / (.25 * efficiency), 0)
+        charge_kw = min(requested_charge_kw, max_into_soc_kw) if discharge_kw == 0 else 0.0
+        soc += charge_kw * .25 * efficiency
+        rows.append((timestamp, charge_kw, discharge_kw, soc))
+    dispatch_data = pd.DataFrame(rows, columns=["timestamp", "charge_kw", "discharge_kw", "soc_kwh"]).set_index("timestamp")
+    return pd.DataFrame({"load_kw": load_kw, "forecast_kw": forecast_kw}).join(dispatch_data).assign(net_load_kw=lambda data: data["load_kw"] + data["charge_kw"] - data["discharge_kw"], energy_charged_kwh=lambda data: data["charge_kw"] * .25, energy_discharged_kwh=lambda data: data["discharge_kw"] * .25)
 
 
 def run_dispatch_demo(frame: pd.DataFrame, forecast: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run the illustrative dispatch demo on the first complete holdout week."""
-    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
-    start = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
-    end = start + pd.Timedelta(days=6, hours=23, minutes=45)
+    """Run the illustrative dispatch demo on the predeclared holdout week."""
+    cutoff = holdout_cutoff(frame)
+    start, end = select_predeclared_holdout_week(frame, cutoff)
     actual = frame.loc[start:end, "load_kw"]
     simulation = dispatch(actual, forecast.loc[actual.index])
+    peak_before_kw = float(actual.max())
     thresholds = pd.DataFrame({"threshold_kw": [70, 80, 90], "risk_posture": ["aggressive protection", "balanced", "arbitrage preserving"]})
+    thresholds["peak_before_kw"] = peak_before_kw
     thresholds["peak_after_dispatch_kw"] = [dispatch(actual, forecast.loc[actual.index], threshold).net_load_kw.max() for threshold in thresholds["threshold_kw"]]
+    thresholds["peak_reduction_kw"] = thresholds["peak_before_kw"] - thresholds["peak_after_dispatch_kw"]
     thresholds["energy_discharged_kwh"] = [dispatch(actual, forecast.loc[actual.index], threshold).energy_discharged_kwh.sum() for threshold in thresholds["threshold_kw"]]
-    thresholds["illustrative_arbitrage_value_eur"] = thresholds["energy_discharged_kwh"] * 0.10
-    thresholds["rule"] = thresholds.apply(lambda row: f"Weekdays 08:00-18:00: clip forecast above {row.threshold_kw} kW ({row.risk_posture})", axis=1)
+    thresholds["energy_charged_kwh"] = [dispatch(actual, forecast.loc[actual.index], threshold).energy_charged_kwh.sum() for threshold in thresholds["threshold_kw"]]
+    thresholds["illustrative_arbitrage_value_eur"] = thresholds["energy_discharged_kwh"] * ILLUSTRATIVE_ARBITRAGE_EUR_PER_KWH
+    thresholds["illustrative_demand_charge_value_eur_per_year"] = thresholds["peak_reduction_kw"] * ILLUSTRATIVE_DEMAND_CHARGE_EUR_PER_KW_YEAR
+    thresholds["rule"] = thresholds.apply(lambda row: f"Discharge whenever the forecast exceeds {row.threshold_kw} kW ({row.risk_posture}); charge whenever both forecast and actual load are below it. Runs every interval, 24/7 -- no time-of-day or weekday restriction.", axis=1)
     return simulation, thresholds
 
 
+def plot_dispatch_simulation(
+    simulation: pd.DataFrame,
+    output_dir: str | Path,
+    threshold_kw: float = 80.0,
+    forecast_label: str = "GBM quantile forecast",
+    filename: str = "06_dispatch_over_time.png",
+) -> Path:
+    """Plot load, forecast, dispatch, and SOC for the simulated week."""
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True, constrained_layout=True)
+    load_axis, battery_axis = axes
+    simulation["load_kw"].plot(ax=load_axis, color="black", lw=1, label="actual load")
+    simulation["forecast_kw"].plot(ax=load_axis, color="#e41a1c", alpha=.8, label=forecast_label)
+    load_axis.axhline(threshold_kw, color="#d95f02", ls="--", label=f"threshold ({threshold_kw:.0f} kW)")
+    load_axis.set_ylabel("Load (kW)")
+    load_axis.set_title("Load and forecast")
+    load_axis.legend(loc="upper left")
+    simulation["charge_kw"].plot(ax=battery_axis, color="#984ea3", alpha=.75, label="battery charge")
+    simulation["discharge_kw"].plot(ax=battery_axis, color="#1b9e77", alpha=.75, label="battery discharge")
+    battery_axis.set_ylabel("Battery power (kW)")
+    battery_axis.set_title("Battery operation")
+    soc_axis = battery_axis.twinx()
+    simulation["soc_kwh"].plot(ax=soc_axis, color="#7570b3", alpha=.75, label="battery SOC")
+    soc_axis.set_ylabel("SOC (kWh)")
+    handles, labels = battery_axis.get_legend_handles_labels()
+    secondary_handles, secondary_labels = soc_axis.get_legend_handles_labels()
+    battery_axis.legend(handles + secondary_handles, labels + secondary_labels, loc="upper left")
+    figure.suptitle(f"Dispatch simulation over holdout week: {simulation.index.min():%d %b} to {simulation.index.max():%d %b %Y}")
+    return save_plot(figure, output_dir, filename)
+
+
 def run_forecast_analysis(frame: pd.DataFrame, output_dir: str | Path) -> dict[str, object]:
-    """Run holdout scoring, regression comparison, and saved forecast plots."""
+    """Run holdout scoring and saved forecast plots."""
     metrics = evaluate_holdout(frame)
-    regression_metrics, coefficients = run_regression_baseline(frame)
-    ridge_metrics, ridge_coefficients = run_ridge_baseline(frame)
     rolling_metrics = evaluate_rolling_validation(frame)
-    paths = plot_forecast_comparison(frame, metrics, output_dir, rolling_metrics)
-    cutoff = frame.index.max() - pd.Timedelta(days=56) + pd.Timedelta(minutes=15)
-    start = cutoff + pd.Timedelta(days=(7 - cutoff.dayofweek) % 7)
-    end = start + pd.Timedelta(days=6, hours=23, minutes=45)
+    cutoff = holdout_cutoff(frame)
+    start, end = select_predeclared_holdout_week(frame, cutoff)
     actual = frame.loc[start:end, "load_kw"]
     forecast = seasonal_forecast(frame, 1, .8, cutoff).loc[actual.index]
+    ridge_forecast_week = ridge_forecast(frame, horizon_slots=1, train_end=cutoff, target_index=actual.index)
+    gbm_forecast = gbm_quantile_forecast(frame, horizon_slots=1, quantile=0.8, train_end=cutoff, target_index=actual.index)
+    # Reuse this week's already-fit ridge/GBM forecasts instead of letting
+    # plot_forecast_comparison refit them a second time for the same week.
+    paths = plot_forecast_comparison(
+        frame, metrics, output_dir, rolling_metrics,
+        ridge_week=ridge_forecast_week, gbm_week=gbm_forecast,
+    )
+    ridge_metrics = metrics.loc[
+        (metrics["horizon_15min"] == 1) & (metrics["model"] == "ridge_load_calendar")
+    ].iloc[0].to_dict()
+    gbm_metrics = metrics.loc[
+        (metrics["horizon_15min"] == 1) & (metrics["model"] == "gbm_quantile")
+    ].iloc[0].to_dict()
     return {
         "metrics": metrics,
-        "regression_metrics": regression_metrics,
-        "coefficients": coefficients,
         "ridge_metrics": ridge_metrics,
-        "ridge_coefficients": ridge_coefficients,
+        "gbm_metrics": gbm_metrics,
         "rolling_metrics": rolling_metrics,
         "plot_paths": paths,
         "actual": actual,
         "forecast": forecast,
+        "gbm_forecast": gbm_forecast,
     }
 
 
 def run_pipeline(input_path: str | Path, output_dir: str | Path = "outputs") -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | str]]:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    prepared = add_calendar_features(load_and_prepare(input_path))
+    prepared = load_and_prepare(input_path)
     metrics = evaluate_holdout(prepared)
     summary = peak_summary(prepared)
     prepared.to_csv(out / "prepared_load.csv")
